@@ -10,6 +10,11 @@
 *.elf
 *.map
 
+# Large media files (too big for GitHub)
+Media/*.mp4
+Media/*.avi
+Media/*.mov
+
 # IDE
 .vscode/
 .idea/
