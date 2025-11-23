@@ -26,9 +26,11 @@ Media/*.mov
 .DS_Store
 Thumbs.db
 
-# Credentials (DO NOT commit these!)
+# Credentials and logs (DO NOT commit these!)
 # Note: Update main.cpp before committing to remove personal credentials
 src/credentials.h
+Mqtt_Log/
+*.log
 config.local.h
 
 # Logs
