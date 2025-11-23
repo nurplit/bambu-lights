@@ -11,7 +11,14 @@ An ESP32-based smart LED controller that brings your Bambu Lab 3D printer to lif
 
 ## 📺 Demo
 
-*Coming soon - add GIF/video of LED effects here*
+### Beacon LED Effects
+<p align="center">
+  <img src="Media/Progress_Bar.gif" width="200" alt="Progress Bar Effect"/>
+  <img src="Media/Climbing_Dot.gif" width="200" alt="Climbing Dot Effect"/>
+  <img src="Media/Beacon.gif" width="200" alt="Beacon Animation"/>
+</p>
+
+*Main LED strip demo coming soon!*
 
 ## ✨ Features
 
