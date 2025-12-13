@@ -1661,7 +1661,12 @@ void updatePrinterLEDs() {
     if (currentMode != MODE_PRINTER) return;
     
     // Door open has priority - skip printer LED updates when door is open
-    if (door_open_lights_enabled && door_is_open) return;
+    // IMPORTANT: This prevents LED state from updating, but door lights handle the override
+    if (door_open_lights_enabled && door_is_open) {
+        // Don't return immediately - let door lights in main loop handle this
+        // This prevents state from getting stuck when door closes
+        return;
+    }
     
     // Priority 1: LiDAR scanning - turn off lights to avoid interference (if enabled)
     if (lidar_lights_off_enabled && lidar_scanning) {
@@ -1672,7 +1677,16 @@ void updatePrinterLEDs() {
     
     // Track LED mode for change detection
     static uint8_t last_led_mode = 0; // 0=none, 1=white, 2=normal
+    static String last_gcode_state = "";
+    static bool finish_effect_logged = false;
     uint8_t current_led_mode = 0;
+    
+    // Log state changes for debugging
+    if (printerStatus.gcode_state != last_gcode_state) {
+        logPrintln(">>> PRINTER STATE CHANGE: " + last_gcode_state + " -> " + printerStatus.gcode_state + " <<<");
+        last_gcode_state = printerStatus.gcode_state;
+        finish_effect_logged = false; // Reset when state changes
+    }
     
     // Priority 2: Timelapse mode - force white lights during printing for consistent lighting
     // Only activate if BOTH the setting is enabled AND timelapse is actually active in the print
@@ -1752,6 +1766,14 @@ void updatePrinterLEDs() {
     } else if (printerStatus.gcode_state == "PAUSE") {
         applyEffect(behavior_pause, printerStatus.progress);
     } else if (printerStatus.gcode_state == "FINISH") {
+        if (!finish_effect_logged) {
+            logPrintln("=== APPLYING FINISH STATE ===");
+            logPrintln("Effect: " + behavior_finish.effect);
+            logPrintln("Color: RGB(" + String(behavior_finish.color.r) + "," + String(behavior_finish.color.g) + "," + String(behavior_finish.color.b) + ")");
+            logPrintln("Brightness: " + String(behavior_finish.brightness) + "%");
+            logPrintln("==============================");
+            finish_effect_logged = true;
+        }
         applyEffect(behavior_finish);
     } else if (printerStatus.gcode_state == "FAILED") {
         // FAILED state (cancelled print) - treat as idle since it's not a real error
@@ -3188,7 +3210,10 @@ void handleRoot() {
     
     html += "</body></html>";
     sendChunk(html);  // Send final closing tags
-    server.sendContent("");  // Signal end of chunked transfer
+    
+    // Properly close chunked transfer
+    server.sendContent("");
+    server.client().stop();  // Ensure client connection closes cleanly
 }
 
 void handleMode() {
@@ -4748,8 +4773,9 @@ void loop() {
                 doorLightsWereActive = false;
                 updatePrinterLEDs(); // Force immediate update to restore printer state
             }
-            // Printer mode - skip updates when door is open (to prevent jogging from changing LED color)
-            else if (!door_is_open) {
+            // Printer mode - always update LEDs, door lights override happens in main loop above
+            // This ensures state doesn't get stuck
+            else {
                 updatePrinterLEDs();
             }
             

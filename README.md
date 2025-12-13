@@ -51,12 +51,14 @@ An ESP32-based smart LED controller that brings your Bambu Lab 3D printer to lif
 - **Auto-Off Timer** - Lights turn off X minutes after print completes (20-120 min)
 - **Timelapse Detection** - Maintains proper lighting during timelapse recording
 
-### � Web Interface
+### 🌐 Web Interface
 - **Modern Dark UI** - Beautiful responsive web interface with live updates
 - **WiFiManager Integration** - Captive portal for easy first-time WiFi setup
 - **OTA Updates** - Wireless firmware updates via mDNS hostname
 - **Configuration Management** - All settings configurable via web UI
 - **Serial Monitor** - Built-in web-based logging for debugging
+- **Web Logs** - Access logs remotely at `http://your-device-ip/logs`
+- **Telnet Support** - Remote serial monitoring via Telnet (port 23)
 - **MQTT Debug Mode** - Toggle full payload logging for troubleshooting
 - **Status Dashboard** - Real-time printer and system status display
 
@@ -72,8 +74,12 @@ An ESP32-based smart LED controller that brings your Bambu Lab 3D printer to lif
 
 #### Optional Components
 - **Second LED Strip** (Beacon progress visualization strip - same types as above)
+  - **Recommended:** 10 pixels for optimal beacon effects
 - **Logic Level Shifter** (if experiencing signal issues - 3.3V to 5V)
 - **Capacitor** (1000µF, 6.3V or higher - smooths power fluctuations)
+
+#### 3D Printed Enclosure
+STL and Fusion 360 files included for ESP32 enclosure that mounts to the [BLV AMS Riser for X1C](https://makerworld.com/en/models/19535-blv-ams-ams-2-riser-for-x1c-p1s-p2s-v4#profileId-19420). Files located in `Enclosure/` folder.
 
 ### Wiring Diagram
 
@@ -198,8 +204,17 @@ Real-time display of:
 - Door status
 - Timer status (active/inactive, time remaining)
 
-### Serial Monitor
-Built-in web-based logging:
+### Serial Monitor & Remote Logging
+Built-in logging accessible three ways:
+
+1. **Web Interface** - Serial monitor panel on main page with auto-refresh
+2. **Direct URL** - Access logs at `http://your-device-ip/logs` via any browser
+3. **Telnet** - Connect via Telnet for real-time streaming logs:
+   ```bash
+   telnet your-device-ip 23
+   ```
+
+Logged events include:
 - Connection events
 - MQTT messages
 - State changes
@@ -358,7 +373,7 @@ Configure in web interface to match your specific LED strip:
 5. Increase OTA timeout in platformio.ini if on slow network
 
 ### Serial Monitor Output
-Normal startup sequence:
+Normal startup sequence (viewable via Serial, Telnet, or `/logs`):
 ```
 === Bambu Lights Controller ===
 Chip: ESP32-D0WDQ6 (revision 1)
@@ -366,15 +381,113 @@ Free Memory: 296504 bytes
 WiFi connecting...
 WiFi connected! IP: 192.168.0.163
 mDNS started: bambu-lights-123456.local
+Telnet server started on port 23
 Starting MQTT connection...
 MQTT connected successfully!
 ```
+
+**Access Logs:**
+- **USB Serial:** Connect via USB, 115200 baud
+- **Telnet:** `telnet 192.168.0.163 23` (use your device IP)
+- **Web Browser:** `http://192.168.0.163/logs` (use your device IP)
 
 Error indicators:
 - `WiFi connection failed` - Check SSID/password
 - `MQTT connection failed` - Check printer IP/access code
 - `Low memory warning` - Reduce LED count or features
 - `LED initialization failed` - Check GPIO pin and LED type
+
+---
+
+## 🏠 Home Automation Integration
+
+### OpenHAB / Home Assistant / Node-RED
+
+The ESP32 can be integrated with home automation systems for advanced control scenarios like:
+- Turn on printer lights when room scene activates
+- Sync printer lights with other smart lighting
+- Create automations based on print status
+- Remote control from automation dashboards
+
+**Current Implementation:**
+The ESP32 currently subscribes only to Bambu Lab printer MQTT topics. For home automation control, you have two options:
+
+**Option 1: HTTP API (Available Now)**
+Use HTTP POST requests to control the device via the web interface:
+```bash
+# OpenHAB HTTP Binding Example
+# Turn lights to specific color (mode=1, manual mode)
+curl -X POST http://192.168.0.163/save \
+  -d "currentMode=1&currentColor=%23FF0000&brightness=100"
+
+# Turn off lights (mode=3)
+curl -X POST http://192.168.0.163/save \
+  -d "currentMode=3"
+
+# Switch to printer mode (mode=0)
+curl -X POST http://192.168.0.163/save \
+  -d "currentMode=0"
+```
+
+**Option 2: MQTT Commands (Feature Request)**
+Future enhancement could add command subscription topics like:
+```
+bambu-lights/command/mode          # 0=printer, 1=manual, 2=auto-cycle, 3=off
+bambu-lights/command/color         # Hex color code (e.g., FF0000)
+bambu-lights/command/brightness    # 0-100
+bambu-lights/command/effect        # solid, blink, breathe, pulse, rainbow
+```
+
+**OpenHAB Example Configuration (HTTP):**
+```
+Thing http:url:bambuLights "Bambu Lights" [
+    baseURL="http://192.168.0.163",
+    refresh=30
+] {
+    Channels:
+        Type switch : power "Power" [
+            onValue="POST:/save:currentMode=0",
+            offValue="POST:/save:currentMode=3"
+        ]
+        Type color : color "Color" [
+            commandExtension="POST:/save?currentMode=1&currentColor=%s"
+        ]
+}
+```
+
+**Home Assistant Example (HTTP):**
+```yaml
+rest_command:
+  bambu_lights_on:
+    url: "http://192.168.0.163/save"
+    method: POST
+    payload: "currentMode=0"
+  
+  bambu_lights_off:
+    url: "http://192.168.0.163/save"
+    method: POST
+    payload: "currentMode=3"
+  
+  bambu_lights_color:
+    url: "http://192.168.0.163/save"
+    method: POST
+    payload: "currentMode=1&currentColor={{ color }}&brightness={{ brightness }}"
+
+automation:
+  - alias: "Sync Printer Lights with Room Scene"
+    trigger:
+      - platform: state
+        entity_id: scene.office_evening
+    action:
+      - service: rest_command.bambu_lights_on
+```
+
+**Node-RED Example:**
+Use HTTP Request node to POST to `/save` endpoint with appropriate parameters.
+
+> 💡 **Tip:** The HTTP API uses the same parameters as the web interface form. Inspect the web page network traffic to see all available parameters.
+
+> 🔧 **Want MQTT control?** This would be a great community contribution! Add subscription to `bambu-lights/command/#` topics in the `connectToMQTT()` function.
 
 ---
 
