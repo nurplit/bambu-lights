@@ -77,6 +77,16 @@ String device_serial = "01S00A123456789";    // Configurable printer serial numb
 bool mqtt_use_ssl = true;                    // Use SSL/TLS for MQTT connection (port 8883)
 bool mqtt_skip_cert_check = true;           // Skip SSL certificate verification (insecure but often needed)
 
+// Home Assistant MQTT Configuration - Configurable via web interface
+bool ha_mqtt_enabled = false;                // Enable/disable HA MQTT publishing
+String ha_mqtt_server = "192.168.0.50";     // Home Assistant MQTT broker IP
+int ha_mqtt_port = 1883;                    // HA MQTT broker port (usually 1883, non-SSL)
+String ha_mqtt_username = "";               // HA MQTT username (empty if no auth)
+String ha_mqtt_password = "";               // HA MQTT password (empty if no auth)
+String ha_discovery_prefix = "homeassistant"; // HA discovery topic prefix
+String ha_device_name = "Bambu Lights";     // Device name in Home Assistant
+bool ha_mqtt_use_ssl = false;               // Usually false for local HA broker
+
 // Preferences for storing settings
 Preferences preferences;
 
@@ -149,7 +159,10 @@ bool telnetConnected = false;
 
 WiFiClient wifiClient;
 WiFiClientSecure wifiClientSecure;
-espMqttClientSecure mqttClient;  // Use secure client for SSL/TLS
+espMqttClientSecure mqttClient;  // Use secure client for SSL/TLS (Bambu printer)
+
+// Home Assistant MQTT Client (separate connection)
+espMqttClient haMqttClient(espMqttClientTypes::UseInternalTask::NO);
 
 // Current mode tracking
 enum LightMode {
@@ -271,6 +284,9 @@ void setAllLEDs(uint8_t r, uint8_t g, uint8_t b);
 void clearAllLEDs();
 void updateLEDs();
 String listTimelapseFiles();
+void publishHAState();
+void publishHADiscovery();
+bool connectHAMQTT();
 
 void clearSettings() {
     preferences.begin("bambu", false);
@@ -379,6 +395,16 @@ void loadSettings() {
     Serial.printf("Loaded beacon climb color: R=%d G=%d B=%d\n", beacon_climb_color.r, beacon_climb_color.g, beacon_climb_color.b);
     Serial.printf("Loaded beacon gradient end: R=%d G=%d B=%d\n", beacon_gradient_end.r, beacon_gradient_end.g, beacon_gradient_end.b);
     
+    // Load Home Assistant MQTT configuration
+    ha_mqtt_enabled = preferences.getBool("ha_mqtt_en", false);
+    ha_mqtt_server = preferences.getString("ha_mqtt_srv", "192.168.0.50");
+    ha_mqtt_port = preferences.getInt("ha_mqtt_port", 1883);
+    ha_mqtt_username = preferences.getString("ha_mqtt_user", "");
+    ha_mqtt_password = preferences.getString("ha_mqtt_pass", "");
+    ha_discovery_prefix = preferences.getString("ha_disc_pfx", "homeassistant");
+    ha_device_name = preferences.getString("ha_dev_name", "Bambu Lights");
+    ha_mqtt_use_ssl = preferences.getBool("ha_mqtt_ssl", false);
+    
     preferences.end();
     
     Serial.println("Settings loaded:");
@@ -389,6 +415,10 @@ void loadSettings() {
     Serial.printf("Beacon: %s, Pin: %d, Count: %d\n", beacon_enabled ? "ENABLED" : "DISABLED", beacon_led_pin, beacon_led_count);
     Serial.printf("Door Lights: %s\n", door_open_lights_enabled ? "ENABLED" : "DISABLED");
     Serial.printf("LiDAR Lights Off: %s\n", lidar_lights_off_enabled ? "ENABLED" : "DISABLED");
+    Serial.printf("Home Assistant MQTT: %s\n", ha_mqtt_enabled ? "ENABLED" : "DISABLED");
+    if (ha_mqtt_enabled) {
+        Serial.printf("  HA Broker: %s:%d\n", ha_mqtt_server.c_str(), ha_mqtt_port);
+    }
     Serial.println("MQTT Password: [HIDDEN]");
 }
 
@@ -443,6 +473,16 @@ void saveSettings() {
     preferences.putUChar("bcn_grad_end_r", beacon_gradient_end.r);
     preferences.putUChar("bcn_grad_end_g", beacon_gradient_end.g);
     preferences.putUChar("bcn_grad_end_b", beacon_gradient_end.b);
+    
+    // Save Home Assistant MQTT configuration
+    preferences.putBool("ha_mqtt_en", ha_mqtt_enabled);
+    preferences.putString("ha_mqtt_srv", ha_mqtt_server);
+    preferences.putInt("ha_mqtt_port", ha_mqtt_port);
+    preferences.putString("ha_mqtt_user", ha_mqtt_username);
+    preferences.putString("ha_mqtt_pass", ha_mqtt_password);
+    preferences.putString("ha_disc_pfx", ha_discovery_prefix);
+    preferences.putString("ha_dev_name", ha_device_name);
+    preferences.putBool("ha_mqtt_ssl", ha_mqtt_use_ssl);
     
     preferences.end();
     
@@ -1686,6 +1726,9 @@ void updatePrinterLEDs() {
         logPrintln(">>> PRINTER STATE CHANGE: " + last_gcode_state + " -> " + printerStatus.gcode_state + " <<<");
         last_gcode_state = printerStatus.gcode_state;
         finish_effect_logged = false; // Reset when state changes
+        
+        // Publish state change to Home Assistant
+        publishHAState();
     }
     
     // Priority 2: Timelapse mode - force white lights during printing for consistent lighting
@@ -1903,6 +1946,223 @@ bool connectMQTT() {
         delay(300); // Reduced delay to keep interface responsive
         yield(); // Yield to keep web server responsive
         
+        return false;
+    }
+}
+
+// Home Assistant MQTT Discovery helpers
+String getDeviceId() {
+    uint32_t chipId = 0;
+    for(int i=0; i<17; i=i+8) {
+        chipId |= ((ESP.getEfuseMac() >> (40 - i)) & 0xff) << i;
+    }
+    return String(chipId, HEX);
+}
+
+void publishHADiscovery() {
+    if (!haMqttClient.connected() || !ha_mqtt_enabled) {
+        return;
+    }
+    
+    String deviceId = "bambu_lights_" + getDeviceId();
+    String baseTopic = "homeassistant/sensor/" + deviceId;
+    
+    // State topic base from device name
+    String stateTopicBase = ha_device_name;
+    stateTopicBase.replace(" ", "_");
+    
+    // Device info shared by all sensors
+    String deviceJson = "\"device\":{\"identifiers\":[\"" + deviceId + "\"],"
+                       "\"name\":\"" + ha_device_name + "\","
+                       "\"manufacturer\":\"Bambu Lights\","
+                       "\"model\":\"ESP32 LED Controller\","
+                       "\"sw_version\":\"1.0\"}";
+    
+    // State sensor
+    String stateConfig = "{\"name\":\"Printer State\","
+                        "\"state_topic\":\"" + stateTopicBase + "/state\","
+                        "\"unique_id\":\"" + deviceId + "_state\","
+                        "\"icon\":\"mdi:printer-3d\","
+                        + deviceJson + "}";
+    haMqttClient.publish((baseTopic + "_state/config").c_str(), 0, true, stateConfig.c_str());
+    
+    // Progress sensor
+    String progressConfig = "{\"name\":\"Print Progress\","
+                           "\"state_topic\":\"" + stateTopicBase + "/progress\","
+                           "\"unique_id\":\"" + deviceId + "_progress\","
+                           "\"unit_of_measurement\":\"%\","
+                           "\"icon\":\"mdi:progress-clock\","
+                           + deviceJson + "}";
+    haMqttClient.publish((baseTopic + "_progress/config").c_str(), 0, true, progressConfig.c_str());
+    
+    // Bed temperature sensor
+    String bedTempConfig = "{\"name\":\"Bed Temperature\","
+                          "\"state_topic\":\"" + stateTopicBase + "/bed_temp\","
+                          "\"unique_id\":\"" + deviceId + "_bed_temp\","
+                          "\"unit_of_measurement\":\"°C\","
+                          "\"device_class\":\"temperature\","
+                          "\"icon\":\"mdi:thermometer\","
+                          + deviceJson + "}";
+    haMqttClient.publish((baseTopic + "_bed_temp/config").c_str(), 0, true, bedTempConfig.c_str());
+    
+    // Nozzle temperature sensor
+    String nozzleTempConfig = "{\"name\":\"Nozzle Temperature\","
+                             "\"state_topic\":\"" + stateTopicBase + "/nozzle_temp\","
+                             "\"unique_id\":\"" + deviceId + "_nozzle_temp\","
+                             "\"unit_of_measurement\":\"°C\","
+                             "\"device_class\":\"temperature\","
+                             "\"icon\":\"mdi:printer-3d-nozzle\","
+                             + deviceJson + "}";
+    haMqttClient.publish((baseTopic + "_nozzle_temp/config").c_str(), 0, true, nozzleTempConfig.c_str());
+    
+    // Layer sensor
+    String layerConfig = "{\"name\":\"Current Layer\","
+                        "\"state_topic\":\"" + stateTopicBase + "/layer\","
+                        "\"unique_id\":\"" + deviceId + "_layer\","
+                        "\"icon\":\"mdi:layers\","
+                        + deviceJson + "}";
+    haMqttClient.publish((baseTopic + "_layer/config").c_str(), 0, true, layerConfig.c_str());
+    
+    // Filename sensor
+    String filenameConfig = "{\"name\":\"Current File\","
+                           "\"state_topic\":\"" + stateTopicBase + "/filename\","
+                           "\"unique_id\":\"" + deviceId + "_filename\","
+                           "\"icon\":\"mdi:file-document\","
+                           + deviceJson + "}";
+    haMqttClient.publish((baseTopic + "_filename/config").c_str(), 0, true, filenameConfig.c_str());
+    
+    // Binary sensor for printing status
+    String binaryBaseTopic = "homeassistant/binary_sensor/" + deviceId;
+    String printingConfig = "{\"name\":\"Printing\","
+                           "\"state_topic\":\"" + stateTopicBase + "/printing\","
+                           "\"unique_id\":\"" + deviceId + "_printing\","
+                           "\"device_class\":\"running\","
+                           "\"payload_on\":\"ON\","
+                           "\"payload_off\":\"OFF\","
+                           + deviceJson + "}";
+    haMqttClient.publish((binaryBaseTopic + "_printing/config").c_str(), 0, true, printingConfig.c_str());
+    
+    logPrintln("HA: Published MQTT Discovery messages");
+}
+
+void publishHAState() {
+    if (!haMqttClient.connected() || !ha_mqtt_enabled) {
+        return;
+    }
+    
+    static unsigned long lastPublish = 0;
+    static String lastState = "";
+    static int lastProgress = -1;
+    static bool firstPublish = true;
+    
+    // Throttle updates to once per second max (but allow first publish)
+    if (!firstPublish && millis() - lastPublish < 1000) {
+        return;
+    }
+    
+    // Force telemetry update every 5 minutes (300000ms)
+    bool forceUpdate = (millis() - lastPublish >= 300000);
+    
+    // Publish if state/progress changed, first publish, or 5 minutes elapsed
+    if (!firstPublish && !forceUpdate && printerStatus.gcode_state == lastState && printerStatus.progress == lastProgress) {
+        return;
+    }
+    
+    firstPublish = false;
+    lastPublish = millis();
+    lastState = printerStatus.gcode_state;
+    lastProgress = printerStatus.progress;
+    
+    // Build topic base from device name
+    String topicBase = ha_device_name;
+    topicBase.replace(" ", "_");
+    
+    // Publish state
+    haMqttClient.publish((topicBase + "/state").c_str(), 0, false, printerStatus.gcode_state.c_str());
+    
+    // Publish progress
+    String progressStr = String(printerStatus.progress);
+    haMqttClient.publish((topicBase + "/progress").c_str(), 0, false, progressStr.c_str());
+    
+    // Publish bed temperature
+    String bedTempStr = String(printerStatus.bed_temp);
+    haMqttClient.publish((topicBase + "/bed_temp").c_str(), 0, false, bedTempStr.c_str());
+    
+    // Publish nozzle temperature
+    String nozzleTempStr = String(printerStatus.nozzle_temp);
+    haMqttClient.publish((topicBase + "/nozzle_temp").c_str(), 0, false, nozzleTempStr.c_str());
+    
+    // Publish layer info
+    String layerStr = String(printerStatus.layer_num) + "/" + String(printerStatus.total_layer_num);
+    haMqttClient.publish((topicBase + "/layer").c_str(), 0, false, layerStr.c_str());
+    
+    // Publish filename
+    haMqttClient.publish((topicBase + "/filename").c_str(), 0, false, printerStatus.gcode_file.c_str());
+    
+    // Publish printing binary sensor
+    bool isPrinting = (printerStatus.gcode_state == "RUNNING" || printerStatus.gcode_state == "PREPARE");
+    haMqttClient.publish((topicBase + "/printing").c_str(), 0, false, isPrinting ? "ON" : "OFF");
+    
+    logPrintln("HA: Published state update - " + printerStatus.gcode_state + " " + String(printerStatus.progress) + "%");
+}
+
+void onHAMqttConnect(bool sessionPresent) {
+    logPrintln("HA MQTT connected! Session present: " + String(sessionPresent));
+    publishHADiscovery();
+    publishHAState(); // Send initial state after discovery
+}
+
+bool connectHAMQTT() {
+    if (!ha_mqtt_enabled) {
+        logPrintln("HA MQTT: Disabled in configuration");
+        return false;
+    }
+    
+    logPrintln("=== HA MQTT Connection Debug ===");
+    logPrintln("HA MQTT Server: " + ha_mqtt_server);
+    logPrintln("HA MQTT Port: " + String(ha_mqtt_port));
+    logPrintln("HA MQTT SSL: " + String(ha_mqtt_use_ssl ? "YES" : "NO"));
+    logPrintln("HA MQTT Username: " + ha_mqtt_username);
+    logPrintln("WiFi Status: " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected"));
+    
+    // Set up callback
+    haMqttClient.onConnect(onHAMqttConnect);
+    
+    // espMqttClient automatically uses non-secure connection
+    // For SSL, we would need espMqttClientSecure (not implemented yet)
+    
+    haMqttClient.setServer(ha_mqtt_server.c_str(), ha_mqtt_port);
+    
+    if (ha_mqtt_username.length() > 0) {
+        haMqttClient.setCredentials(ha_mqtt_username.c_str(), ha_mqtt_password.c_str());
+    }
+    
+    haMqttClient.setKeepAlive(60);
+    
+    logPrintln("Connecting to HA MQTT: " + ha_mqtt_server + ":" + String(ha_mqtt_port));
+    
+    // Use unique client ID
+    String clientId = "bambu_lights_" + String(random(100000, 999999));
+    logPrintln("HA Client ID: " + clientId);
+    haMqttClient.setClientId(clientId.c_str());
+    
+    haMqttClient.connect();
+    
+    // Wait for connection with timeout
+    int connectionAttempts = 0;
+    const int maxAttempts = 30; // 15 seconds timeout
+    while (!haMqttClient.connected() && connectionAttempts < maxAttempts) {
+        delay(500);
+        connectionAttempts++;
+        yield();
+    }
+    
+    if (haMqttClient.connected()) {
+        logPrintln("HA MQTT connected successfully!");
+        return true;
+    } else {
+        logPrintln("HA MQTT connection failed!");
+        logPrintln("Check your HA MQTT broker settings.");
         return false;
     }
 }
@@ -2540,6 +2800,52 @@ void handleRoot() {
     html += "<b>Info:</b> Beacon strip requires a separate GPIO pin from your main LED strip. <b>SK6812 LEDs</b> come in both RGB (3-channel) and RGBW (4-channel with white) variants - if you see wrong colors, enable the RGBW checkbox above. Settings are saved automatically.";
     html += "</div>";
     
+    // Home Automation MQTT Section
+    html += "<h3 style='color: #41bdf5; margin: 25px 0 15px 0; border-bottom: 2px solid #41bdf5; padding-bottom: 5px;'>&#127968; Home Automation MQTT</h3>";
+    html += "<div style='margin-bottom: 15px; padding: 15px; background: #e3f2fd; border: 1px solid #90caf9; border-radius: 8px;'>";
+    html += "<label style='display: flex; align-items: center; font-size: 15px; font-weight: 500; cursor: pointer; margin-bottom: 12px;'>";
+    html += "<input type='checkbox' id='haMqttEnabled' style='margin-right: 12px; transform: scale(1.4);'>";
+    html += "<span>&#9989; Enable MQTT Discovery</span>";
+    html += "</label>";
+    html += "<p style='font-size: 12px; color: #666; margin: 0 0 0 28px;'>Publishes printer status, progress, and temperatures to your home automation MQTT broker (OpenHAB, Home Assistant, etc.)</p>";
+    html += "</div>";
+    html += "<div style='margin-bottom: 20px;'>";
+    html += "<label style='display: block; margin-bottom: 8px; font-weight: 500; color: #555;'>MQTT Broker IP:</label>";
+    html += "<input type='text' id='haMqttServer' style='width: calc(100% - 20px); padding: 12px; border: 2px solid #ddd; border-radius: 8px; font-size: 14px;' placeholder='192.168.0.50'>";
+    html += "</div>";
+    html += "<div style='margin-bottom: 20px;'>";
+    html += "<label style='display: block; margin-bottom: 8px; font-weight: 500; color: #555;'>MQTT Port:</label>";
+    html += "<input type='number' id='haMqttPort' min='1' max='65535' style='width: calc(100% - 20px); padding: 12px; border: 2px solid #ddd; border-radius: 8px; font-size: 14px;' value='1883'>";
+    html += "</div>";
+    html += "<div style='margin-bottom: 20px;'>";
+    html += "<label style='display: block; margin-bottom: 8px; font-weight: 500; color: #555;'>Username (optional):</label>";
+    html += "<input type='text' id='haMqttUsername' style='width: calc(100% - 20px); padding: 12px; border: 2px solid #ddd; border-radius: 8px; font-size: 14px;' placeholder=''>";
+    html += "</div>";
+    html += "<div style='margin-bottom: 20px;'>";
+    html += "<label style='display: block; margin-bottom: 8px; font-weight: 500; color: #555;'>Password (optional):</label>";
+    html += "<input type='password' id='haMqttPassword' style='width: calc(100% - 20px); padding: 12px; border: 2px solid #ddd; border-radius: 8px; font-size: 14px;' placeholder='Password'>";
+    html += "</div>";
+    html += "<div style='margin-bottom: 20px;'>";
+    html += "<label style='display: block; margin-bottom: 8px; font-weight: 500; color: #555;'>Discovery Prefix:</label>";
+    html += "<input type='text' id='haDiscoveryPrefix' style='width: calc(100% - 20px); padding: 12px; border: 2px solid #ddd; border-radius: 8px; font-size: 14px;' value='homeassistant' placeholder='homeassistant'>";
+    html += "<small style='color: #6c757d; display: block; margin-top: 4px;'>Use 'homeassistant' for HA auto-discovery, or custom prefix for OpenHAB/other systems</small>";
+    html += "</div>";
+    html += "<div style='margin-bottom: 20px;'>";
+    html += "<label style='display: block; margin-bottom: 8px; font-weight: 500; color: #555;'>Device Name:</label>";
+    html += "<input type='text' id='haDeviceName' style='width: calc(100% - 20px); padding: 12px; border: 2px solid #ddd; border-radius: 8px; font-size: 14px;' value='Bambu Lights' placeholder='Bambu Lights'>";
+    html += "</div>";
+    html += "<div style='margin-bottom: 15px; padding: 15px; background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 8px;'>";
+    html += "<label style='display: flex; align-items: center; cursor: pointer;'>";
+    html += "<input type='checkbox' id='haMqttUseSSL' style='margin-right: 10px; transform: scale(1.2);'>";
+    html += "<span style='font-weight: 500; color: #856404;'>Use SSL/TLS</span>";
+    html += "</label>";
+    html += "<small style='color: #6c757d; display: block; margin-top: 8px;'>&#9888; Most MQTT brokers use port 1883 without SSL (OpenHAB, Home Assistant default)</small>";
+    html += "</div>";
+    html += "<button onclick='saveHAMqttConfig()' class='btn btn-success' style='width: 100%; padding: 12px; margin-top: 10px;'>&#128190; Save MQTT Settings</button>";
+    html += "<div style='background: #e3f2fd; border: 1px solid #90caf9; border-radius: 8px; padding: 10px; margin-top: 15px; font-size: 13px;'>";
+    html += "<b>&#128161; Published Topics:</b> Printer state, progress, temperatures, layer info, and filename are published to <code>bambu-lights/sensor/*</code> topics. Works with OpenHAB, Home Assistant (auto-discovery), Node-RED, and any MQTT-compatible automation system.";
+    html += "</div>";
+    
     // WiFi Reset Section
     html += "<h3 style='color: #dc3545; margin: 25px 0 15px 0; border-bottom: 2px solid #dc3545; padding-bottom: 5px;'>&#128246; WiFi Management</h3>";
     html += "<div style='padding: 15px; background: #fff3cd; border: 2px solid #ffc107; border-radius: 8px; margin-bottom: 25px;'>";
@@ -2874,8 +3180,24 @@ void handleRoot() {
     html += "        document.getElementById('beaconRGBWConfig').checked = data.rgbw || false;\n";
     html += "      })\n";
     html += "      .catch(error => {\n";
-    html += "        console.error('Error loading config:', error);\n";
-    html += "        alert('Failed to load configuration: ' + error.message);\n";
+    html += "        console.error('Error loading beacon config:', error);\n";
+    html += "      });\n";
+    html += "    \n";
+    html += "    // Load Home Automation MQTT settings\n";
+    html += "    fetch('/hamqttconfig')\n";
+    html += "      .then(response => response.json())\n";
+    html += "      .then(data => {\n";
+    html += "        document.getElementById('haMqttEnabled').checked = data.enabled || false;\n";
+    html += "        document.getElementById('haMqttServer').value = data.server || '192.168.0.50';\n";
+    html += "        document.getElementById('haMqttPort').value = data.port || 1883;\n";
+    html += "        document.getElementById('haMqttUsername').value = data.username || '';\n";
+    html += "        document.getElementById('haMqttPassword').value = data.password || '';\n";
+    html += "        document.getElementById('haDiscoveryPrefix').value = data.discovery_prefix || 'homeassistant';\n";
+    html += "        document.getElementById('haDeviceName').value = data.device_name || 'Bambu Lights';\n";
+    html += "        document.getElementById('haMqttUseSSL').checked = data.use_ssl || false;\n";
+    html += "      })\n";
+    html += "      .catch(error => {\n";
+    html += "        console.error('Error loading automation MQTT config:', error);\n";
     html += "      });\n";
     html += "  } catch(e) {\n";
     html += "    console.error('Exception in showConfig:', e);\n";
@@ -2923,6 +3245,28 @@ void handleRoot() {
     html += "    .catch(error => {\n";
     html += "      console.error('Error saving config:', error);\n";
     html += "      alert('Failed to save configuration. Please try again.');\n";
+    html += "    });\n";
+    html += "}\n";
+    
+    html += "function saveHAMqttConfig() {\n";
+    html += "  const enabled = document.getElementById('haMqttEnabled').checked;\n";
+    html += "  const server = document.getElementById('haMqttServer').value;\n";
+    html += "  const port = document.getElementById('haMqttPort').value;\n";
+    html += "  const username = document.getElementById('haMqttUsername').value;\n";
+    html += "  const password = document.getElementById('haMqttPassword').value;\n";
+    html += "  const prefix = document.getElementById('haDiscoveryPrefix').value;\n";
+    html += "  const deviceName = document.getElementById('haDeviceName').value;\n";
+    html += "  const useSSL = document.getElementById('haMqttUseSSL').checked;\n";
+    html += "  \n";
+    html += "  const url = `/setconfig?ha_mqtt_enabled=${enabled}&ha_mqtt_server=${encodeURIComponent(server)}&ha_mqtt_port=${port}&ha_mqtt_username=${encodeURIComponent(username)}&ha_mqtt_password=${encodeURIComponent(password)}&ha_discovery_prefix=${encodeURIComponent(prefix)}&ha_device_name=${encodeURIComponent(deviceName)}&ha_mqtt_use_ssl=${useSSL}`;\n";
+    html += "  fetch(url)\n";
+    html += "    .then(response => response.text())\n";
+    html += "    .then(data => {\n";
+    html += "      alert(data);\n";
+    html += "    })\n";
+    html += "    .catch(error => {\n";
+    html += "      console.error('Error saving automation MQTT config:', error);\n";
+    html += "      alert('Failed to save MQTT configuration. Please try again.');\n";
     html += "    });\n";
     html += "}\n";
     
@@ -3595,11 +3939,89 @@ void handleGetConfig() {
     server.send(200, "application/json", json);
 }
 
+void handleGetHAMqttConfig() {
+    logPrintln("HTTP: /hamqttconfig requested");
+    String json = "{";
+    json += "\"enabled\":" + String(ha_mqtt_enabled ? "true" : "false") + ",";
+    json += "\"server\":\"" + ha_mqtt_server + "\",";
+    json += "\"port\":" + String(ha_mqtt_port) + ",";
+    json += "\"username\":\"" + ha_mqtt_username + "\",";
+    json += "\"password\":\"" + ha_mqtt_password + "\",";
+    json += "\"discovery_prefix\":\"" + ha_discovery_prefix + "\",";
+    json += "\"device_name\":\"" + ha_device_name + "\",";
+    json += "\"use_ssl\":" + String(ha_mqtt_use_ssl ? "true" : "false");
+    json += "}";
+    
+    server.send(200, "application/json", json);
+}
+
 void handleSetConfig() {
     bool hasAllParams = server.hasArg("server") && server.hasArg("password") && server.hasArg("serial");
     bool hasLedParams = server.hasArg("led_pin") && server.hasArg("num_leds");
     bool hasAutoCycleParams = server.hasArg("cycle_speed") || server.hasArg("cycle_brightness");
     bool hasToggleParams = server.hasArg("door_lights_enabled") || server.hasArg("chamber_sync") || server.hasArg("timelapse_white");
+    bool hasHAParams = server.hasArg("ha_mqtt_enabled") || server.hasArg("ha_mqtt_server");
+    
+    // Handle Home Assistant MQTT settings separately
+    if (hasHAParams && !hasAllParams) {
+        if (server.hasArg("ha_mqtt_enabled")) {
+            ha_mqtt_enabled = server.arg("ha_mqtt_enabled") == "true";
+            logPrintln("HA MQTT Enabled: " + String(ha_mqtt_enabled ? "YES" : "NO"));
+        }
+        
+        if (server.hasArg("ha_mqtt_server")) {
+            ha_mqtt_server = server.arg("ha_mqtt_server");
+        }
+        
+        if (server.hasArg("ha_mqtt_port")) {
+            int port = server.arg("ha_mqtt_port").toInt();
+            if (port > 0 && port <= 65535) {
+                ha_mqtt_port = port;
+            }
+        }
+        
+        if (server.hasArg("ha_mqtt_username")) {
+            ha_mqtt_username = server.arg("ha_mqtt_username");
+        }
+        
+        if (server.hasArg("ha_mqtt_password")) {
+            ha_mqtt_password = server.arg("ha_mqtt_password");
+        }
+        
+        if (server.hasArg("ha_discovery_prefix")) {
+            ha_discovery_prefix = server.arg("ha_discovery_prefix");
+        }
+        
+        if (server.hasArg("ha_device_name")) {
+            ha_device_name = server.arg("ha_device_name");
+        }
+        
+        if (server.hasArg("ha_mqtt_use_ssl")) {
+            ha_mqtt_use_ssl = server.arg("ha_mqtt_use_ssl") == "true";
+        }
+        
+        saveSettings();
+        
+        // Reconnect if enabled
+        if (ha_mqtt_enabled) {
+            if (haMqttClient.connected()) {
+                haMqttClient.disconnect();
+            }
+            delay(500);
+            bool connected = connectHAMQTT();
+            if (connected) {
+                server.send(200, "text/plain", "HA MQTT settings saved and connected successfully!");
+            } else {
+                server.send(200, "text/plain", "HA MQTT settings saved but connection failed. Check settings.");
+            }
+        } else {
+            if (haMqttClient.connected()) {
+                haMqttClient.disconnect();
+            }
+            server.send(200, "text/plain", "HA MQTT disabled and saved!");
+        }
+        return;
+    }
     
     // Handle toggle settings separately (don't require full config)
     if (hasToggleParams && !hasAllParams) {
@@ -4367,6 +4789,7 @@ void setupWebServer() {
     server.on("/color", handleColor);
     server.on("/status", handleStatus);
     server.on("/getconfig", handleGetConfig);
+    server.on("/hamqttconfig", handleGetHAMqttConfig);
     server.on("/setconfig", handleSetConfig);
     server.on("/resetconfig", handleResetConfig);
     server.on("/door", handleDoor);
@@ -4504,6 +4927,18 @@ void setup() {
             }
         }
         
+        // Connect to Home Assistant MQTT if enabled
+        if (ha_mqtt_enabled) {
+            Serial.println("Connecting to Home Assistant MQTT...");
+            bool haMqttConnected = connectHAMQTT();
+            
+            if (haMqttConnected) {
+                Serial.println("Home Assistant MQTT connected successfully!");
+            } else {
+                Serial.println("Home Assistant MQTT connection failed");
+            }
+        }
+        
         Serial.println("Starting normal operation...");
     } else {
         Serial.println("Running in offline mode...");
@@ -4591,6 +5026,13 @@ void loop() {
         yield(); // Give time for background processing
     }
     
+    // Handle Home Assistant MQTT
+    if (WiFi.status() == WL_CONNECTED && ha_mqtt_enabled) {
+        haMqttClient.loop(); // Process MQTT messages (required when UseInternalTask::NO)
+        publishHAState(); // Check and publish telemetry updates
+        yield(); // Give time for background processing
+    }
+    
     // Check WiFi status every 30 seconds
     if (millis() - lastWiFiCheck > 30000) {
         lastWiFiCheck = millis();
@@ -4605,6 +5047,10 @@ void loop() {
                 yield();
                 connectMQTT(); // Reconnect MQTT
                 yield();
+                if (ha_mqtt_enabled) {
+                    connectHAMQTT(); // Reconnect Home Assistant MQTT
+                    yield();
+                }
             }
         }
     }

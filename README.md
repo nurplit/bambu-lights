@@ -401,16 +401,118 @@ Error indicators:
 
 ## 🏠 Home Automation Integration
 
-### OpenHAB / Home Assistant / Node-RED
+### Home Assistant MQTT Discovery (Auto-Configuration)
 
-The ESP32 can be integrated with home automation systems for advanced control scenarios like:
-- Turn on printer lights when room scene activates
-- Sync printer lights with other smart lighting
-- Create automations based on print status
-- Remote control from automation dashboards
+**NEW!** Bambu Lights now supports **Home Assistant MQTT Discovery** - sensors auto-appear in Home Assistant with zero manual configuration!
 
-**Current Implementation:**
-The ESP32 currently subscribes only to Bambu Lab printer MQTT topics. For home automation control, you have two options:
+#### Quick Setup (3 Steps)
+1. **Configure in Web UI:**
+   - Open web interface: `http://192.168.0.163`
+   - Click **Config** button
+   - Scroll to **Home Assistant MQTT** section
+   - Enable and enter your HA MQTT broker details:
+     * **HA MQTT Broker:** Your Home Assistant IP (e.g., `192.168.0.50`)
+     * **Port:** Usually `1883` (non-SSL)
+     * **Username/Password:** Optional (if broker requires auth)
+     * **Discovery Prefix:** Default `homeassistant` (leave unchanged)
+   - Click **Save HA MQTT Settings**
+
+2. **Check Home Assistant:**
+   - Go to **Settings → Devices & Services → MQTT**
+   - You'll see a new device: **Bambu Lights**
+   - Automatically created sensors:
+     * `sensor.bambu_lights_printer_state` (IDLE, RUNNING, FINISH, etc.)
+     * `sensor.bambu_lights_print_progress` (0-100%)
+     * `sensor.bambu_lights_bed_temperature` (°C)
+     * `sensor.bambu_lights_nozzle_temperature` (°C)
+     * `sensor.bambu_lights_current_layer` (layer X/Y)
+     * `sensor.bambu_lights_current_file` (filename)
+     * `binary_sensor.bambu_lights_printing` (ON/OFF)
+
+3. **Create Automations:**
+   - Drag sensors into automation editor
+   - No YAML needed - fully visual!
+
+#### Example Automations
+
+**Print Complete Notification (Alexa TTS):**
+```yaml
+alias: "Bambu Print Complete - Alexa Announcement"
+trigger:
+  - platform: state
+    entity_id: sensor.bambu_lights_printer_state
+    to: "FINISH"
+action:
+  - service: notify.alexa_media
+    data:
+      target:
+        - media_player.office_echo
+      message: "Your 3D print is complete! {{ states('sensor.bambu_lights_current_file') }} finished printing."
+```
+
+**Phone Notification When Print Finishes:**
+```yaml
+alias: "Bambu Print Complete - Push Notification"
+trigger:
+  - platform: state
+    entity_id: sensor.bambu_lights_printer_state
+    to: "FINISH"
+action:
+  - service: notify.mobile_app_iphone
+    data:
+      title: "3D Print Complete!"
+      message: "{{ states('sensor.bambu_lights_current_file') }} - {{ states('sensor.bambu_lights_print_progress') }}%"
+```
+
+**Turn on Room Lights When Print Starts:**
+```yaml
+alias: "Bambu Print Started - Office Lights On"
+trigger:
+  - platform: state
+    entity_id: binary_sensor.bambu_lights_printing
+    to: "on"
+action:
+  - service: light.turn_on
+    target:
+      entity_id: light.office_ceiling
+    data:
+      brightness: 255
+```
+
+**Progress Bar Dashboard Card:**
+```yaml
+type: gauge
+entity: sensor.bambu_lights_print_progress
+name: Print Progress
+unit: "%"
+min: 0
+max: 100
+```
+
+#### Architecture
+- **Dual MQTT Connections:** ESP32 maintains two separate MQTT broker connections:
+  1. **Printer MQTT** (SSL 8883): Subscribes to Bambu Lab printer status
+  2. **Home Assistant MQTT** (1883): Publishes sensor states for HA
+
+- **Real-Time Updates:** State changes trigger immediate sensor updates (throttled to max 1/sec)
+- **Auto-Discovery:** Uses MQTT Discovery protocol - entities appear automatically in HA
+- **No Cloud Required:** Everything runs locally on your network
+
+#### Troubleshooting
+- **Sensors not appearing?**
+  * Check HA MQTT broker is running (Settings → Add-ons → Mosquitto broker)
+  * Verify broker IP/port in Config page
+  * Check ESP32 logs via Telnet: `telnet 192.168.0.163`
+  * Look for "HA MQTT connected successfully!" message
+
+- **Connection failed?**
+  * Most HA MQTT brokers use port **1883 without SSL**
+  * If using SSL (port 8883), enable "Use SSL/TLS for HA broker" checkbox
+  * Username/password only needed if you configured auth in Mosquitto
+
+### OpenHAB / Other Home Automation Systems
+
+For systems without MQTT Discovery support, use the **HTTP API**:
 
 **Option 1: HTTP API (Available Now)**
 Use HTTP POST requests to control the device via the web interface:
@@ -455,7 +557,7 @@ Thing http:url:bambuLights "Bambu Lights" [
 }
 ```
 
-**Home Assistant Example (HTTP):**
+**Home Assistant Example (HTTP - Legacy):**
 ```yaml
 rest_command:
   bambu_lights_on:
@@ -467,25 +569,12 @@ rest_command:
     url: "http://192.168.0.163/save"
     method: POST
     payload: "currentMode=3"
-  
-  bambu_lights_color:
-    url: "http://192.168.0.163/save"
-    method: POST
-    payload: "currentMode=1&currentColor={{ color }}&brightness={{ brightness }}"
-
-automation:
-  - alias: "Sync Printer Lights with Room Scene"
-    trigger:
-      - platform: state
-        entity_id: scene.office_evening
-    action:
-      - service: rest_command.bambu_lights_on
 ```
 
 **Node-RED Example:**
 Use HTTP Request node to POST to `/save` endpoint with appropriate parameters.
 
-> 💡 **Tip:** The HTTP API uses the same parameters as the web interface form. Inspect the web page network traffic to see all available parameters.
+> 💡 **Tip:** Use MQTT Discovery for Home Assistant (see above) - it's much easier than HTTP API!
 
 > 🔧 **Want MQTT control?** This would be a great community contribution! Add subscription to `bambu-lights/command/#` topics in the `connectToMQTT()` function.
 
