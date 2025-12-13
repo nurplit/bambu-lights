@@ -433,6 +433,21 @@ Error indicators:
    - Drag sensors into automation editor
    - No YAML needed - fully visual!
 
+#### Why Use This for Notifications?
+
+**For Bambu Lab Printers in LAN-Only Mode:**
+
+If you're running your Bambu Lab printer in **LAN-only mode** (not connected to Bambu Cloud), you lose access to the official Bambu Handy app's push notifications for print completion, errors, and status updates. 
+
+**Bambu Lights MQTT integration solves this!** By publishing real-time printer status to your home automation system, you can create your own notification system with:
+- **Push Notifications** to your phone (iOS/Android apps)
+- **SMS/Text Messages** via services like Twilio
+- **Email Alerts** for print completion or failures
+- **Voice Announcements** via Alexa, Google Home, or smart speakers (TTS)
+- **Smart Home Triggers** like turning on lights, sending Discord/Slack messages, etc.
+
+All of this works **completely offline** on your local network - no cloud connection required!
+
 #### Example Automations
 
 **Print Complete Notification (Alexa TTS):**
