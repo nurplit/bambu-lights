@@ -124,11 +124,30 @@ struct RGBW {
     uint8_t r, g, b, w;
 };
 
+enum class RgbOrder : uint8_t {
+    RGB = 0,
+    GRB = 1,
+    BRG = 2,
+    RBG = 3,
+    GBR = 4,
+    BGR = 5,
+};
+
+enum class RgbwSwapMode : uint8_t {
+    None = 0,
+    SwapWWithR = 1,
+    SwapWWithG = 2,
+    SwapWWithB = 3,
+};
+
 // LED Array and RMT data (dynamically allocated in setup)
 RGB* leds = nullptr;
 RGBW* rgbw_leds = nullptr;
 rmt_item32_t* led_data = nullptr;
 bool is_rgbw = false; // Track if using RGBW LEDs
+bool main_rgbw_enabled = false; // Explicit setting for main strip RGBW (SK6812 can be RGB or RGBW)
+RgbwSwapMode main_rgbw_swap = RgbwSwapMode::None;
+RgbOrder main_rgb_order = RgbOrder::GRB;
 
 // Beacon LED Array (second strip for progress display)
 RGB* beacon_leds = nullptr;
@@ -140,6 +159,7 @@ int beacon_led_type = 0; // Default: WS2812B
 int beacon_color_order = 1; // Default: GRB
 bool beacon_enabled = false;
 bool beacon_is_rgbw = false; // Track if beacon uses RGBW LEDs
+RgbwSwapMode beacon_rgbw_swap = RgbwSwapMode::None;
 String beacon_effect = "progress"; // progress, climbing, gradient, pulse
 RGB beacon_color = {0, 255, 0}; // Default: green (start color for gradient)
 int beacon_brightness = 80;
@@ -307,6 +327,17 @@ void loadSettings() {
     num_leds = preferences.getInt("num_leds", 10);
     led_type = preferences.getString("led_type", "WS2812B");
     color_order = preferences.getString("color_order", "GRB");
+    if (preferences.isKey("main_rgbw")) {
+        main_rgbw_enabled = preferences.getBool("main_rgbw", false);
+    } else {
+        // Backfill prior behavior: selecting SK6812 implied RGBW mode.
+        main_rgbw_enabled = (led_type == "SK6812");
+    }
+    uint8_t mainSwap = preferences.getUChar("main_rgbw_swap", 0);
+    if (mainSwap > static_cast<uint8_t>(RgbwSwapMode::SwapWWithB)) {
+        mainSwap = static_cast<uint8_t>(RgbwSwapMode::None);
+    }
+    main_rgbw_swap = static_cast<RgbwSwapMode>(mainSwap);
     
     // Load door event configuration
     door_open_lights_enabled = preferences.getBool("door_lights", false);
@@ -378,6 +409,11 @@ void loadSettings() {
     beacon_led_type = preferences.getInt("beacon_type", 0); // 0 = WS2812B
     beacon_color_order = preferences.getInt("beacon_order", 1); // 1 = GRB
     beacon_is_rgbw = preferences.getBool("beacon_rgbw", false); // RGB by default
+    uint8_t beaconSwap = preferences.getUChar("beacon_rgbw_swap", 0);
+    if (beaconSwap > static_cast<uint8_t>(RgbwSwapMode::SwapWWithB)) {
+        beaconSwap = static_cast<uint8_t>(RgbwSwapMode::None);
+    }
+    beacon_rgbw_swap = static_cast<RgbwSwapMode>(beaconSwap);
     beacon_effect = preferences.getString("beacon_fx", "progress");
     beacon_color.r = preferences.getUChar("beacon_r", 0);
     beacon_color.g = preferences.getUChar("beacon_g", 255);
@@ -434,6 +470,8 @@ void saveSettings() {
     preferences.putInt("num_leds", num_leds);
     preferences.putString("led_type", led_type);
     preferences.putString("color_order", color_order);
+    preferences.putBool("main_rgbw", main_rgbw_enabled);
+    preferences.putUChar("main_rgbw_swap", static_cast<uint8_t>(main_rgbw_swap));
     
     // Save door event configuration
     preferences.putBool("door_lights", door_open_lights_enabled);
@@ -461,6 +499,7 @@ void saveSettings() {
     preferences.putInt("beacon_type", beacon_led_type);
     preferences.putInt("beacon_order", beacon_color_order);
     preferences.putBool("beacon_rgbw", beacon_is_rgbw);
+    preferences.putUChar("beacon_rgbw_swap", static_cast<uint8_t>(beacon_rgbw_swap));
     preferences.putString("beacon_fx", beacon_effect);
     preferences.putUChar("beacon_r", beacon_color.r);
     preferences.putUChar("beacon_g", beacon_color.g);
@@ -516,46 +555,109 @@ void configureLEDTiming() {
     T1H = LED_TIMINGS[typeIndex].t1h;
     T1L = LED_TIMINGS[typeIndex].t1l;
     
-    // Check if this is an RGBW LED type
-    is_rgbw = (led_type == "SK6812");
+    // Check if this is an RGBW LED type (explicit toggle: SK6812 can be RGB or RGBW).
+    is_rgbw = (led_type == "SK6812") && main_rgbw_enabled;
+    if (color_order == "RGB") {
+        main_rgb_order = RgbOrder::RGB;
+    } else if (color_order == "GRB") {
+        main_rgb_order = RgbOrder::GRB;
+    } else if (color_order == "BRG") {
+        main_rgb_order = RgbOrder::BRG;
+    } else if (color_order == "RBG") {
+        main_rgb_order = RgbOrder::RBG;
+    } else if (color_order == "GBR") {
+        main_rgb_order = RgbOrder::GBR;
+    } else if (color_order == "BGR") {
+        main_rgb_order = RgbOrder::BGR;
+    } else {
+        main_rgb_order = RgbOrder::GRB;
+    }
     
     // LED timing configured
 }
 
+static char rgbOrderChar(RgbOrder order, int index) {
+    switch (order) {
+        case RgbOrder::RGB: {
+            const char chars[] = {'R', 'G', 'B'};
+            return chars[index];
+        }
+        case RgbOrder::GRB: {
+            const char chars[] = {'G', 'R', 'B'};
+            return chars[index];
+        }
+        case RgbOrder::BRG: {
+            const char chars[] = {'B', 'R', 'G'};
+            return chars[index];
+        }
+        case RgbOrder::RBG: {
+            const char chars[] = {'R', 'B', 'G'};
+            return chars[index];
+        }
+        case RgbOrder::GBR: {
+            const char chars[] = {'G', 'B', 'R'};
+            return chars[index];
+        }
+        case RgbOrder::BGR: {
+            const char chars[] = {'B', 'G', 'R'};
+            return chars[index];
+        }
+    }
+    return 'G';
+}
+
+static uint8_t rgbComponent(RGB color, char component) {
+    switch (component) {
+        case 'R': return color.r;
+        case 'G': return color.g;
+        case 'B': return color.b;
+        default: return 0;
+    }
+}
+
+static uint32_t packRgb(RGB color, RgbOrder order) {
+    const uint8_t byte0 = rgbComponent(color, rgbOrderChar(order, 0));
+    const uint8_t byte1 = rgbComponent(color, rgbOrderChar(order, 1));
+    const uint8_t byte2 = rgbComponent(color, rgbOrderChar(order, 2));
+    return (static_cast<uint32_t>(byte0) << 16) | (static_cast<uint32_t>(byte1) << 8) | static_cast<uint32_t>(byte2);
+}
+
+static uint32_t packRgbw(RGB color, uint8_t white, RgbOrder order, RgbwSwapMode swap) {
+    uint8_t bytes[4] = {
+        rgbComponent(color, rgbOrderChar(order, 0)),
+        rgbComponent(color, rgbOrderChar(order, 1)),
+        rgbComponent(color, rgbOrderChar(order, 2)),
+        white,
+    };
+
+    const char swapTarget =
+        (swap == RgbwSwapMode::SwapWWithR) ? 'R' :
+        (swap == RgbwSwapMode::SwapWWithG) ? 'G' :
+        (swap == RgbwSwapMode::SwapWWithB) ? 'B' :
+        '\0';
+
+    if (swapTarget != '\0') {
+        for (int i = 0; i < 3; i++) {
+            if (rgbOrderChar(order, i) == swapTarget) {
+                const uint8_t tmp = bytes[i];
+                bytes[i] = bytes[3];
+                bytes[3] = tmp;
+                break;
+            }
+        }
+    }
+
+    return (static_cast<uint32_t>(bytes[0]) << 24) |
+           (static_cast<uint32_t>(bytes[1]) << 16) |
+           (static_cast<uint32_t>(bytes[2]) << 8) |
+           static_cast<uint32_t>(bytes[3]);
+}
+
 uint32_t applyColorOrder(RGB color, uint8_t white = 0) {
     if (is_rgbw) {
-        // For RGBW LEDs (SK6812), return 32-bit value with white channel
-        // SK6812 standard order is GRBW (Green, Red, Blue, White)
-        if (color_order == "RGBW") {
-            return (color.r << 24) | (color.g << 16) | (color.b << 8) | white;
-        } else if (color_order == "GRBW" || color_order == "GRB") {
-            // GRB maps to GRBW for SK6812
-            return (color.g << 24) | (color.r << 16) | (color.b << 8) | white;
-        } else if (color_order == "RGB") {
-            // RGB maps to RGBW
-            return (color.r << 24) | (color.g << 16) | (color.b << 8) | white;
-        } else {
-            // Default: GRBW (standard SK6812 order)
-            return (color.g << 24) | (color.r << 16) | (color.b << 8) | white;
-        }
-    } else {
-        // For RGB LEDs, return 24-bit value
-        if (color_order == "RGB") {
-            return (color.r << 16) | (color.g << 8) | color.b;
-        } else if (color_order == "GRB") {
-            return (color.g << 16) | (color.r << 8) | color.b;
-        } else if (color_order == "BRG") {
-            return (color.b << 16) | (color.r << 8) | color.g;
-        } else if (color_order == "RBG") {
-            return (color.r << 16) | (color.b << 8) | color.g;
-        } else if (color_order == "GBR") {
-            return (color.g << 16) | (color.b << 8) | color.r;
-        } else if (color_order == "BGR") {
-            return (color.b << 16) | (color.g << 8) | color.r;
-        }
-        // Default to GRB if unknown
-        return (color.g << 16) | (color.r << 8) | color.b;
+        return packRgbw(color, white, main_rgb_order, main_rgbw_swap);
     }
+    return packRgb(color, main_rgb_order);
 }
 
 void setupRMT() {
@@ -756,17 +858,12 @@ void beaconRgbToRMT(RGB* colors, rmt_item32_t* items, int numLeds) {
     for (int led = 0; led < numLeds; led++) {
         uint32_t color;
         if (beacon_is_rgbw && beacon_rgbw_leds) {
-            // RGBW: send all 4 channels
-            RGBW rgbw = beacon_rgbw_leds[led];
-            switch (beacon_color_order) {
-                case 0: color = ((uint32_t)rgbw.r << 24) | ((uint32_t)rgbw.g << 16) | ((uint32_t)rgbw.b << 8) | rgbw.w; break; // RGBW
-                case 1: color = ((uint32_t)rgbw.g << 24) | ((uint32_t)rgbw.r << 16) | ((uint32_t)rgbw.b << 8) | rgbw.w; break; // GRBW
-                case 2: color = ((uint32_t)rgbw.b << 24) | ((uint32_t)rgbw.r << 16) | ((uint32_t)rgbw.g << 8) | rgbw.w; break; // BRGW
-                case 3: color = ((uint32_t)rgbw.r << 24) | ((uint32_t)rgbw.b << 16) | ((uint32_t)rgbw.g << 8) | rgbw.w; break; // RBGW
-                case 4: color = ((uint32_t)rgbw.g << 24) | ((uint32_t)rgbw.b << 16) | ((uint32_t)rgbw.r << 8) | rgbw.w; break; // GBRW
-                case 5: color = ((uint32_t)rgbw.b << 24) | ((uint32_t)rgbw.g << 16) | ((uint32_t)rgbw.r << 8) | rgbw.w; break; // BGRW
-                default: color = ((uint32_t)rgbw.g << 24) | ((uint32_t)rgbw.r << 16) | ((uint32_t)rgbw.b << 8) | rgbw.w; break; // Default GRBW
-            }
+            // RGBW: apply RGB order, then optionally swap W with R/G/B (WLED-style).
+            const RGBW rgbw = beacon_rgbw_leds[led];
+            const RGB rgb_part = {rgbw.r, rgbw.g, rgbw.b};
+            const int orderIndex = (beacon_color_order >= 0 && beacon_color_order <= 5) ? beacon_color_order : 1;
+            const RgbOrder order = static_cast<RgbOrder>(orderIndex);
+            color = packRgbw(rgb_part, rgbw.w, order, beacon_rgbw_swap);
         } else {
             // RGB: send 3 channels
             color = applyBeaconColorOrder(colors[led]);
@@ -806,22 +903,30 @@ void updateBeaconLEDs() {
     }
 }
 
-void setBeaconLED(int index, uint8_t r, uint8_t g, uint8_t b) {
-    if (index >= 0 && index < beacon_led_count && beacon_leds) {
-        // Always set RGB values in beacon_leds (used as staging)
-        beacon_leds[index].r = r;
-        beacon_leds[index].g = g;
-        beacon_leds[index].b = b;
-        
-        // Also set RGBW array if in RGBW mode
-        if (beacon_is_rgbw && beacon_rgbw_leds) {
-            beacon_rgbw_leds[index].r = r;
-            beacon_rgbw_leds[index].g = g;
-            beacon_rgbw_leds[index].b = b;
-            beacon_rgbw_leds[index].w = 0; // No white channel for color LEDs
-        }
-    }
-}
+	void setBeaconLED(int index, uint8_t r, uint8_t g, uint8_t b, uint8_t w = 0) {
+	    if (index >= 0 && index < beacon_led_count && beacon_leds) {
+	        // Always set RGB values in beacon_leds (used as staging)
+	        beacon_leds[index].r = r;
+	        beacon_leds[index].g = g;
+	        beacon_leds[index].b = b;
+	        
+	        // Also set RGBW array if in RGBW mode
+	        if (beacon_is_rgbw && beacon_rgbw_leds) {
+	            // For RGBW LEDs, optimize pure white/gray by using the white channel
+	            if (w == 0 && r > 0 && r == g && g == b) {
+	                beacon_rgbw_leds[index].r = 0;
+	                beacon_rgbw_leds[index].g = 0;
+	                beacon_rgbw_leds[index].b = 0;
+	                beacon_rgbw_leds[index].w = r;
+	            } else {
+	                beacon_rgbw_leds[index].r = r;
+	                beacon_rgbw_leds[index].g = g;
+	                beacon_rgbw_leds[index].b = b;
+	                beacon_rgbw_leds[index].w = w;
+	            }
+	        }
+	    }
+	}
 
 void clearBeaconLEDs() {
     for (int i = 0; i < beacon_led_count; i++) {
@@ -2743,9 +2848,28 @@ void handleRoot() {
     html += "</select>";
     html += "</div>";
     html += "</div>";
+
+    html += "<div style='display: flex; gap: 15px; margin-bottom: 20px; align-items: center;'>";
+    html += "<div style='flex: 1;'>";
+    html += "<label style='display: flex; align-items: center; cursor: pointer; font-weight: 500; color: #555;'>";
+    html += "<input type='checkbox' id='mainRGBWConfig' style='margin-right: 10px; width: 18px; height: 18px;'>";
+    html += "<span>RGBW enabled (4-channel)</span>";
+    html += "</label>";
+    html += "<p style='font-size: 12px; color: #666; margin: 6px 0 0 28px;'>Enable for SK6812 RGBW strips; disable for SK6812 RGB (3-channel).</p>";
+    html += "</div>";
+    html += "<div style='flex: 1;'>";
+    html += "<label style='display: block; margin-bottom: 8px; font-weight: 500; color: #555;'>RGBW Swap:</label>";
+    html += "<select id='mainRGBWSwapConfig' style='width: 100%; padding: 12px; border: 2px solid #ddd; border-radius: 8px; font-size: 14px;'>";
+    html += "<option value='0'>None</option>";
+    html += "<option value='1'>Swap W &amp; R</option>";
+    html += "<option value='2'>Swap W &amp; G</option>";
+    html += "<option value='3'>Swap W &amp; B</option>";
+    html += "</select>";
+    html += "</div>";
+    html += "</div>";
     
     html += "<div style='background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 8px; padding: 10px; margin-bottom: 25px; font-size: 13px;'>";
-    html += "<b>Note:</b> Changing LED settings (pin, count, type, or color order) requires ESP32 restart. Avoid GPIO 0, 1, 3, 6-12 (boot/flash pins).";
+    html += "<b>Note:</b> Changing LED settings (pin, count, type, color order, or RGBW settings) requires ESP32 restart. Avoid GPIO 0, 1, 3, 6-12 (boot/flash pins).";
     html += "</div>";
     
     // Beacon LED Hardware Configuration
@@ -2790,14 +2914,26 @@ void handleRoot() {
     html += "</select>";
     html += "</div>";
     html += "</div>";
-    html += "<div style='margin-bottom: 20px;'>";
+    html += "<div style='display: flex; gap: 15px; margin-bottom: 20px; align-items: center;'>";
+    html += "<div style='flex: 1;'>";
     html += "<label style='display: flex; align-items: center; cursor: pointer;'>";
     html += "<input type='checkbox' id='beaconRGBWConfig' style='margin-right: 8px; width: 18px; height: 18px;'>";
-    html += "<span style='font-weight: 500; color: #555;'>RGBW LEDs (4-channel with white - check this if colors are wrong)</span>";
+    html += "<span style='font-weight: 500; color: #555;'>Beacon RGBW enabled (4-channel)</span>";
     html += "</label>";
+    html += "<p style='font-size: 12px; color: #666; margin: 6px 0 0 28px;'>Enable if your beacon strip has a dedicated white channel.</p>";
+    html += "</div>";
+    html += "<div style='flex: 1;'>";
+    html += "<label style='display: block; margin-bottom: 8px; font-weight: 500; color: #555;'>Beacon RGBW Swap:</label>";
+    html += "<select id='beaconRGBWSwapConfig' style='width: 100%; padding: 12px; border: 2px solid #ddd; border-radius: 8px; font-size: 14px;'>";
+    html += "<option value='0'>None</option>";
+    html += "<option value='1'>Swap W &amp; R</option>";
+    html += "<option value='2'>Swap W &amp; G</option>";
+    html += "<option value='3'>Swap W &amp; B</option>";
+    html += "</select>";
+    html += "</div>";
     html += "</div>";
     html += "<div style='background: #e7f3ff; border: 1px solid #b3d9ff; border-radius: 8px; padding: 10px; margin-bottom: 25px; font-size: 13px;'>";
-    html += "<b>Info:</b> Beacon strip requires a separate GPIO pin from your main LED strip. <b>SK6812 LEDs</b> come in both RGB (3-channel) and RGBW (4-channel with white) variants - if you see wrong colors, enable the RGBW checkbox above. Settings are saved automatically.";
+    html += "<b>Info:</b> Beacon strip requires a separate GPIO pin from your main LED strip. <b>SK6812 LEDs</b> come in both RGB (3-channel) and RGBW (4-channel with white) variants - enable RGBW for 4-channel strips, and use RGBW Swap if white/colors are incorrect. Settings are saved automatically.";
     html += "</div>";
     
     // Home Automation MQTT Section
@@ -3160,6 +3296,8 @@ void handleRoot() {
     html += "        document.getElementById('numLeds').value = data.num_leds || 10;\n";
     html += "        document.getElementById('ledType').value = data.led_type || 'WS2812B';\n";
     html += "        document.getElementById('colorOrder').value = data.color_order || 'GRB';\n";
+    html += "        document.getElementById('mainRGBWConfig').checked = data.rgbw || false;\n";
+    html += "        document.getElementById('mainRGBWSwapConfig').value = (data.rgbw_swap ?? 0);\n";
     html += "        console.log('Opening modal...');\n";
     html += "        document.getElementById('configModal').style.display = 'block';\n";
     html += "      })\n";
@@ -3178,6 +3316,7 @@ void handleRoot() {
     html += "        document.getElementById('beaconTypeConfig').value = data.type || 0;\n";
     html += "        document.getElementById('beaconColorOrderConfig').value = data.colorOrder || 1;\n";
     html += "        document.getElementById('beaconRGBWConfig').checked = data.rgbw || false;\n";
+    html += "        document.getElementById('beaconRGBWSwapConfig').value = (data.rgbw_swap ?? 0);\n";
     html += "      })\n";
     html += "      .catch(error => {\n";
     html += "        console.error('Error loading beacon config:', error);\n";
@@ -3220,6 +3359,8 @@ void handleRoot() {
     html += "  const skipCert = document.getElementById('skipCert').checked;\n";
     html += "  const ledType = document.getElementById('ledType').value;\n";
     html += "  const colorOrder = document.getElementById('colorOrder').value;\n";
+    html += "  const mainRGBW = document.getElementById('mainRGBWConfig').checked;\n";
+    html += "  const mainRGBWSwap = document.getElementById('mainRGBWSwapConfig').value;\n";
     html += "  \n";
     html += "  // Save beacon hardware settings\n";
     html += "  const beaconEnabled = document.getElementById('beaconEnabledConfig').checked;\n";
@@ -3228,13 +3369,14 @@ void handleRoot() {
     html += "  const beaconType = document.getElementById('beaconTypeConfig').value;\n";
     html += "  const beaconColorOrder = document.getElementById('beaconColorOrderConfig').value;\n";
     html += "  const beaconRGBW = document.getElementById('beaconRGBWConfig').checked;\n";
-    html += "  const beaconUrl = `/beaconconfig?enabled=${beaconEnabled ? '1' : '0'}&pin=${beaconPin}&count=${beaconCount}&type=${beaconType}&colorOrder=${beaconColorOrder}&rgbw=${beaconRGBW ? '1' : '0'}`;\n";
+    html += "  const beaconRGBWSwap = document.getElementById('beaconRGBWSwapConfig').value;\n";
+    html += "  const beaconUrl = `/beaconconfig?enabled=${beaconEnabled ? '1' : '0'}&pin=${beaconPin}&count=${beaconCount}&type=${beaconType}&colorOrder=${beaconColorOrder}&rgbw=${beaconRGBW ? '1' : '0'}&rgbw_swap=${beaconRGBWSwap}`;\n";
     html += "  fetch(beaconUrl)\n";
     html += "    .then(response => response.text())\n";
     html += "    .then(data => console.log('Beacon config saved:', data))\n";
     html += "    .catch(error => console.error('Error saving beacon config:', error));\n";
     html += "  \n";
-    html += "  let url = '/setconfig?server=' + encodeURIComponent(server) + '&password=' + encodeURIComponent(password) + '&serial=' + encodeURIComponent(serial) + '&port=' + encodeURIComponent(port) + '&use_ssl=' + useSSL + '&skip_cert=' + skipCert + '&led_pin=' + ledPin + '&num_leds=' + numLeds + '&led_type=' + encodeURIComponent(ledType) + '&color_order=' + encodeURIComponent(colorOrder);\n";
+    html += "  let url = '/setconfig?server=' + encodeURIComponent(server) + '&password=' + encodeURIComponent(password) + '&serial=' + encodeURIComponent(serial) + '&port=' + encodeURIComponent(port) + '&use_ssl=' + useSSL + '&skip_cert=' + skipCert + '&led_pin=' + ledPin + '&num_leds=' + numLeds + '&led_type=' + encodeURIComponent(ledType) + '&color_order=' + encodeURIComponent(colorOrder) + '&rgbw=' + (mainRGBW ? '1' : '0') + '&rgbw_swap=' + encodeURIComponent(mainRGBWSwap);\n";
     html += "  fetch(url)\n";
     html += "    .then(response => response.text())\n";
     html += "    .then(data => {\n";
@@ -3926,6 +4068,8 @@ void handleGetConfig() {
     json += "\"num_leds\":" + String(num_leds) + ",";
     json += "\"led_type\":\"" + led_type + "\",";
     json += "\"color_order\":\"" + color_order + "\",";
+    json += "\"rgbw\":" + String(main_rgbw_enabled ? "true" : "false") + ",";
+    json += "\"rgbw_swap\":" + String(static_cast<uint8_t>(main_rgbw_swap)) + ",";
     json += "\"door_lights_enabled\":" + String(door_open_lights_enabled ? "true" : "false") + ",";
     json += "\"door_color\":\"" + rgbToHex(door_open_color.r, door_open_color.g, door_open_color.b) + "\",";
     json += "\"auto_off_minutes\":" + String(auto_off_minutes) + ",";
@@ -4152,6 +4296,26 @@ void handleSetConfig() {
             }
             if (validOrder && new_color_order != color_order) {
                 color_order = new_color_order;
+                ledChanged = true;
+            }
+        }
+
+        // Handle main strip RGBW settings (SK6812 can be RGB or RGBW)
+        if (server.hasArg("rgbw")) {
+            bool newRgbw = server.arg("rgbw") == "true" || server.arg("rgbw") == "1";
+            if (newRgbw != main_rgbw_enabled) {
+                main_rgbw_enabled = newRgbw;
+                ledChanged = true;
+            }
+        }
+
+        if (server.hasArg("rgbw_swap")) {
+            int newSwap = server.arg("rgbw_swap").toInt();
+            if (newSwap < 0) newSwap = 0;
+            if (newSwap > static_cast<int>(RgbwSwapMode::SwapWWithB)) newSwap = 0;
+            const RgbwSwapMode newMode = static_cast<RgbwSwapMode>(newSwap);
+            if (newMode != main_rgbw_swap) {
+                main_rgbw_swap = newMode;
                 ledChanged = true;
             }
         }
@@ -4532,6 +4696,7 @@ void handleBeaconSettings() {
     json += "\"type\":" + String(beacon_led_type) + ",";
     json += "\"colorOrder\":" + String(beacon_color_order) + ",";
     json += "\"rgbw\":" + String(beacon_is_rgbw ? "true" : "false") + ",";
+    json += "\"rgbw_swap\":" + String(static_cast<uint8_t>(beacon_rgbw_swap)) + ",";
     json += "\"effect\":\"" + beacon_effect + "\",";
     json += "\"color\":\"" + rgbToHex(beacon_color) + "\",";
     json += "\"brightness\":" + String(beacon_brightness) + ",";
@@ -4605,6 +4770,18 @@ void handleBeaconConfig() {
             needsReinit = true;
         }
     }
+
+    // Update RGBW swap mode (WLED-style)
+    if (server.hasArg("rgbw_swap")) {
+        int newSwap = server.arg("rgbw_swap").toInt();
+        if (newSwap < 0) newSwap = 0;
+        if (newSwap > static_cast<int>(RgbwSwapMode::SwapWWithB)) newSwap = 0;
+        const RgbwSwapMode newMode = static_cast<RgbwSwapMode>(newSwap);
+        if (newMode != beacon_rgbw_swap) {
+            beacon_rgbw_swap = newMode;
+            needsReinit = true;
+        }
+    }
     
     // Update color order
     if (server.hasArg("colorOrder")) {
@@ -4664,6 +4841,7 @@ void handleBeaconConfig() {
     preferences.putInt("beacon_type", beacon_led_type);
     preferences.putInt("beacon_order", beacon_color_order);
     preferences.putBool("beacon_rgbw", beacon_is_rgbw);  // SAVE RGBW SETTING
+    preferences.putUChar("beacon_rgbw_swap", static_cast<uint8_t>(beacon_rgbw_swap));
     preferences.putString("beacon_fx", beacon_effect);
     preferences.putUChar("beacon_r", beacon_color.r);
     preferences.putUChar("beacon_g", beacon_color.g);
